@@ -1,0 +1,378 @@
+.Dd November 4, 2026
+.Dt MK-WEB-MANIFEST 1
+.Os
+.Sh NAME
+.Nm mk-web-manifest.sh
+.Nd generate and verify a signed, RFC 3161 timestamped SHA-256 asset manifest
+.Sh SYNOPSIS
+.Nm
+.Op Fl Lq
+.Op Fl C Ar ca-file
+.Op Fl d Ar dir
+.Op Fl k Ar gpg-key
+.Op Fl m Ar manifest
+.Op Fl t Ar tsa
+.Op Fl x Ar pattern
+.Op Fl -ca-path Ar dir
+.Op Fl -clearsign
+.Op Fl -gpg-homedir Ar dir
+.Op Fl -include-vcs
+.Op Fl -keep-tsq | Fl -no-keep-tsq
+.Op Fl -timeout Ar seconds
+.Op Fl -untrusted Ar cert-file
+.Op Ar target-dir
+.Nm
+.Fl V
+.Op Fl Lq
+.Op Fl C Ar ca-file
+.Op Fl d Ar dir
+.Op Fl m Ar manifest
+.Op Fl x Ar pattern
+.Op Fl -allow-untracked
+.Op Fl -ca-path Ar dir
+.Op Fl -gpg-homedir Ar dir
+.Op Fl -include-vcs
+.Op Fl -keyring Ar file
+.Op Fl -no-ts-cert-verify
+.Op Fl -untrusted Ar cert-file
+.Op Ar target-dir
+.Nm
+.Fl -list-tsa
+.Nm
+.Fl h | Fl v
+.Sh DESCRIPTION
+The
+.Nm
+utility creates and verifies a cryptographic attestation bundle for static web
+assets or release directories using strictly POSIX-compliant shell facilities.
+.Pp
+In generation mode (the default),
+.Nm
+performs four atomic steps inside a private staging directory before committing
+the resulting artifacts to
+.Ar target-dir
+(which defaults to the current working directory):
+.Bl -enum
+.It
+Scans
+.Ar target-dir
+for regular files, rejects paths containing control characters, backslashes, or
+unexpected symbolic links, and produces a locale-independent, deterministically
+sorted
+.Pa SHA256SUMS
+manifest.
+.It
+Signs the manifest using GnuPG with SHA-256, producing a detached ASCII-armored
+signature
+.Pq Pa SHA256SUMS.asc
+and immediately self-verifying the signature.
+.It
+Generates an RFC 3161 TimeStampReq query
+.Pq Pa SHA256SUMS.asc.tsq
+containing a SHA-256 message imprint of the signature file and a random
+64-bit cryptographic nonce.
+.It
+Submits the query via HTTPS/HTTP to a configurable RFC 3161 Time Stamping
+Authority (TSA), validates the returned TimeStampResp DER token
+.Pq Pa SHA256SUMS.asc.tsr
+for a
+.Dq Granted
+status, matching SHA-256 message imprint, and matching cryptographic nonce, and
+atomically moves all verified artifacts into
+.Ar target-dir .
+.El
+.Pp
+In verification mode
+.Pq Fl V / Fl -verify ,
+.Nm
+performs three-layer cryptographic verification in strict outer-to-inner order:
+.Bl -enum
+.It
+.Sy Temporal Proof (RFC 3161 Timestamp) :
+Validates the DER structure, status, SHA-256 message imprint, nonce, and X.509
+certificate trust chain of
+.Pa SHA256SUMS.asc.tsr
+(and
+.Pa SHA256SUMS.asc.tsq
+if present) against
+.Pa SHA256SUMS.asc .
+.It
+.Sy Authenticity (GPG Signature) :
+Verifies the GnuPG signature in
+.Pa SHA256SUMS.asc
+against
+.Pa SHA256SUMS ,
+requiring explicit
+.Dv GOODSIG
+and
+.Dv VALIDSIG
+status tokens and rejecting weak digest algorithms (MD5, SHA-1, RIPEMD-160).
+.It
+.Sy Asset Integrity (SHA-256 Checksums & Directory Bijection) :
+Validates the manifest against path traversal, duplicate entries, and control
+characters, verifies every listed file's SHA-256 digest on disk, and ensures no
+untracked files exist in
+.Ar target-dir .
+.El
+.Sh OPTIONS
+.Bl -tag -width Ds
+.It Fl V , Fl -verify
+Verify existing attestation artifacts in
+.Ar target-dir
+instead of generating new ones.
+.It Fl d Ar dir , Fl -dir Ar dir
+Operate on directory
+.Ar dir .
+May also be specified as the positional
+.Ar target-dir
+argument.
+.It Fl m Ar name , Fl -manifest Ar name
+Use
+.Ar name
+as the manifest filename instead of the default
+.Pa SHA256SUMS .
+Must be a simple filename without path separators or leading dots.
+.It Fl k Ar key , Fl -gpg-key Ar key
+Sign the manifest using the specified GnuPG key ID, fingerprint, or user ID.
+.It Fl -gpg-homedir Ar dir
+Use
+.Ar dir
+as the GnuPG home directory
+.Pq Ql gpg --homedir .
+.It Fl -keyring Ar file
+Use an additional GnuPG keyring file during signature verification.
+.It Fl -clearsign
+Generate an inline clearsigned signature instead of a detached ASCII-armored
+signature.
+.It Fl t Ar tsa , Fl -tsa Ar tsa
+Select the RFC 3161 Time Stamping Authority by preset name (see
+.Sx TSA PRESETS )
+or by full
+.Ql https://
+or
+.Ql http://
+endpoint URL.
+Defaults to
+.Cm freetsa .
+.It Fl -list-tsa
+Display the table of built-in RFC 3161 TSA presets and exit.
+.It Fl -timeout Ar seconds
+Maximum time in seconds allowed for the TSA network request.
+Defaults to 30.
+.It Fl -keep-tsq
+Retain the
+.Pa SHA256SUMS.asc.tsq
+query artifact alongside
+.Pa SHA256SUMS.asc.tsr
+after generation (default).
+.It Fl -no-keep-tsq
+Delete the
+.Pa SHA256SUMS.asc.tsq
+query artifact after generation.
+.It Fl C Ar file , Fl -ca-file Ar file
+Trusted CA certificate bundle in PEM format for X.509 verification of the TSA
+response token
+.Pq Ql openssl ts -verify -CAfile .
+.It Fl -ca-path Ar dir
+Directory of hashed trusted CA certificates for TSA verification
+.Pq Ql openssl ts -verify -CApath .
+.It Fl -untrusted Ar file
+Additional untrusted intermediate certificates in PEM format for TSA
+verification
+.Pq Ql openssl ts -verify -untrusted .
+.It Fl -no-ts-cert-verify
+During
+.Fl V / Fl -verify ,
+verify the RFC 3161 token structure, status, SHA-256 message imprint, and nonce,
+but skip X.509 CA root trust chain validation.
+.It Fl x Ar pattern , Fl -exclude Ar pattern
+Exclude files or directories matching the glob
+.Ar pattern .
+May be specified multiple times.
+.It Fl -include-vcs
+Do not automatically exclude
+.Pa .git ,
+.Pa .hg ,
+and
+.Pa .svn
+version control directories.
+.It Fl L , Fl -follow-symlinks
+Follow symbolic links when scanning and verifying files.
+By default, symbolic links are rejected for security.
+.It Fl -allow-untracked
+During
+.Fl V / Fl -verify ,
+emit a warning instead of failing when untracked files are found in
+.Ar target-dir .
+.It Fl q , Fl -quiet
+Suppress informational progress messages; only warnings and errors are written
+to standard error.
+.It Fl h , Fl -help
+Display usage information and exit.
+.It Fl v , Fl -version
+Display version string and exit.
+.El
+.Sh TSA PRESETS
+The following preset names may be passed to
+.Fl t / Fl -tsa
+or set in
+.Ev TSA_URL :
+.Bl -tag -width "globalsign"
+.It Cm freetsa
+.Lk https://freetsa.org/tsr
+(default)
+.It Cm digicert
+.Lk https://timestamp.digicert.com
+.It Cm sectigo
+.Lk https://timestamp.sectigo.com
+.It Cm globalsign
+.Lk http://timestamp.globalsign.com/tsa/r6advanced1
+.It Cm entrust
+.Lk http://timestamp.entrust.net/TSS/RFC3161sha2TS
+.It Cm apple
+.Lk http://timestamp.apple.com/ts01
+.It Cm identrust
+.Lk http://timestamp.identrust.com
+.El
+.Sh ENVIRONMENT
+.Bl -tag -width "POSIX_MANIFEST_SHA256_BACKEND"
+.It Ev TSA_URL
+Default TSA preset name or endpoint URL (overridden by
+.Fl t ) .
+.It Ev GPG_KEY
+Default GnuPG key ID or fingerprint for signing (overridden by
+.Fl k ) .
+.It Ev GPG_HOMEDIR
+Default GnuPG home directory (overridden by
+.Fl -gpg-homedir ) .
+.It Ev GPG_KEYRING
+Default GnuPG keyring file for verification (overridden by
+.Fl -keyring ) .
+.It Ev TSA_CA_FILE
+Default trusted CA PEM file for RFC 3161 verification (overridden by
+.Fl C ) .
+.It Ev TSA_CA_PATH
+Default trusted CA directory for RFC 3161 verification (overridden by
+.Fl -ca-path ) .
+.It Ev TSA_UNTRUSTED_FILE
+Default untrusted intermediate certificate file (overridden by
+.Fl -untrusted ) .
+.It Ev TSA_TIMEOUT
+Default HTTP request timeout in seconds (overridden by
+.Fl -timeout ) .
+.It Ev MANIFEST_NAME
+Default manifest filename (overridden by
+.Fl m ) .
+.It Ev KEEP_TSQ
+Set to
+.Ql 1
+(default) to retain the
+.Pa .tsq
+query file or
+.Ql 0
+to remove it.
+.It Ev POSIX_MANIFEST_SHA256_BACKEND
+Optional override for the SHA-256 utility backend:
+.Cm sha256sum ,
+.Cm shasum ,
+.Cm sha256 ,
+or
+.Cm openssl .
+.It Ev TMPDIR
+Directory in which the private
+.Pq Li 0700
+staging directory is created.
+Defaults to
+.Pa /tmp .
+.El
+.Sh FILES
+.Bl -tag -width "SHA256SUMS.asc.tsr"
+.It Pa SHA256SUMS
+Deterministic, lexicographically sorted SHA-256 checksum manifest.
+.It Pa SHA256SUMS.asc
+ASCII-armored GnuPG signature over
+.Pa SHA256SUMS .
+.It Pa SHA256SUMS.asc.tsq
+ASN.1 DER-encoded RFC 3161 TimeStampReq query for
+.Pa SHA256SUMS.asc .
+.It Pa SHA256SUMS.asc.tsr
+ASN.1 DER-encoded RFC 3161 TimeStampResp token issued by the TSA.
+.El
+.Sh EXIT STATUS
+.Bl -tag -width Ds
+.It Dv 0
+Success.
+.It Dv 1
+General runtime or filesystem error.
+.It Dv 2
+Invalid command-line option, argument, or configuration.
+.It Dv 3
+Missing required external dependency
+.Pq Xr gpg 1 , Xr openssl 1 , Xr curl 1 , or SHA-256 tool .
+.It Dv 4
+Manifest or asset integrity error (empty directory, unsafe filename, symbolic
+link, path traversal, duplicate entry, checksum mismatch, or untracked file).
+.It Dv 5
+GnuPG signing or signature verification failure.
+.It Dv 6
+RFC 3161 timestamp query creation, TSA network request, or token verification
+failure.
+.El
+.Sh EXAMPLES
+Generate an attestation bundle in
+.Pa ./public
+using the DigiCert TSA and a specific GPG signing key:
+.Bd -literal -offset indent
+mk-web-manifest.sh -t digicert -k 0xDEADBEEF12345678 ./public
+.Ed
+.Pp
+Verify the attestation bundle in
+.Pa ./public
+using a custom TSA root CA certificate:
+.Bd -literal -offset indent
+mk-web-manifest.sh -V -C /path/to/tsa-root-ca.pem ./public
+.Ed
+.Pp
+Exclude source maps and temporary files during generation:
+.Bd -literal -offset indent
+mk-web-manifest.sh -x '*.map' -x '*.tmp' ./dist
+.Ed
+.Sh SEE ALSO
+.Xr curl 1 ,
+.Xr find 1 ,
+.Xr gpg 1 ,
+.Xr openssl 1 ,
+.Xr sha256sum 1 ,
+.Xr shasum 1
+.Sh STANDARDS
+The
+.Nm
+script conforms to
+.St -p1003.1-2008
+(and IEEE Std 1003.1-2017 / 1003.1-2024).
+Timestamp queries and responses conform to IETF RFC 3161 and RFC 5816.
+.Sh SECURITY CONSIDERATIONS
+.Bl -bullet
+.It
+.Sy Atomic Staging :
+All artifacts are constructed and self-verified in a mode
+.Li 0700
+temporary directory before being moved into
+.Ar target-dir ,
+preventing partial or unverified outputs from overwriting valid attestations on
+failure.
+.It
+.Sy Path Traversal & Injection Prevention :
+Filenames containing ASCII control characters (including newlines, carriage
+returns, and ANSI terminal escape sequences) or backslashes are rejected during
+both generation and verification.
+During verification, parent directory traversal segments
+.Pq Pa .. ,
+absolute paths, symbolic links (unless
+.Fl L
+is specified), and duplicate manifest entries are strictly rejected.
+.It
+.Sy Verify-Then-Parse :
+In verification mode, the RFC 3161 timestamp and GnuPG signature are verified
+before manifest file paths are parsed or accessed.
+.El
