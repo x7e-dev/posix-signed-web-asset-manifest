@@ -43,6 +43,10 @@ GPG_KEYRING="${GPG_KEYRING:-}"
 GPG_SIGN_MODE="detached"
 MANIFEST_NAME="${MANIFEST_NAME:-SHA256SUMS}"
 KEEP_TSQ="${KEEP_TSQ:-1}"
+ARCHIVE_ENABLED=0
+ARCHIVE_DIR="${ARCHIVE_DIR:-proofs}"
+FORCE_REGEN=0
+PROVE_FILE=""
 TSA_CA_FILE="${TSA_CA_FILE:-}"
 TSA_CA_PATH="${TSA_CA_PATH:-}"
 TSA_UNTRUSTED_FILE="${TSA_UNTRUSTED_FILE:-}"
@@ -219,7 +223,9 @@ usage() {
     cat <<EOF
 Usage:
   $PROGNAME [OPTIONS] [TARGET_DIR]
+  $PROGNAME -a [OPTIONS] [TARGET_DIR]
   $PROGNAME -V [OPTIONS] [TARGET_DIR]
+  $PROGNAME -P FILE [OPTIONS] [TARGET_DIR]
   $PROGNAME --list-tsa
 
 Generate or verify a deterministic SHA-256 asset manifest (SHA256SUMS),
@@ -229,6 +235,8 @@ GPG cryptographic signature (SHA256SUMS.asc), and RFC 3161 trusted timestamp
 Modes:
   (default)              Generate manifest, GPG signature, and RFC 3161 timestamp
   -V, --verify           Verify existing manifest, signature, and timestamp
+  -P, --prove FILE       Prove original publication date of FILE across archived
+                         and active timestamped manifests
       --list-tsa         List built-in RFC 3161 TSA presets and exit
   -h, --help             Display this help message and exit
   -v, --version          Display version information and exit
@@ -236,6 +244,12 @@ Modes:
 Options:
   -d, --dir DIR          Target directory (default: positional TARGET_DIR or '.')
   -m, --manifest NAME    Manifest filename (default: SHA256SUMS)
+  -a, --archive          Archive existing manifest bundle into proofs/<timestamp>/
+                         when site files change (and skip if unchanged)
+      --archive-dir DIR  Directory (relative to TARGET_DIR) for archived proofs
+                         (default: proofs; implies --archive)
+      --force            Force regeneration (and archiving if -a is set) even if
+                         no tracked asset hashes have changed
   -k, --gpg-key KEY      GPG key ID, fingerprint, or email for signing
       --gpg-homedir DIR  Custom GnuPG home directory
       --keyring FILE     Additional GPG keyring file for verification
@@ -250,7 +264,7 @@ Options:
       --untrusted FILE   Untrusted intermediate certificates PEM for TSA verify
       --no-ts-cert-verify
                          Verify timestamp token imprint/nonce without X.509 CA
-                         chain validation during --verify
+                         chain validation during --verify or --prove
   -x, --exclude PATTERN  Exclude files/directories matching glob PATTERN
                          (may be specified multiple times)
       --include-vcs      Do not exclude .git, .hg, and .svn directories
@@ -268,6 +282,7 @@ Environment Variables:
   TSA_UNTRUSTED_FILE     Default untrusted cert file for RFC 3161 verification
   TSA_TIMEOUT            Default TSA HTTP timeout in seconds (default: 30)
   MANIFEST_NAME          Default manifest filename (default: SHA256SUMS)
+  ARCHIVE_DIR            Default archive directory relative to TARGET_DIR (default: proofs)
   KEEP_TSQ               Set to 1 to keep .tsq (default) or 0 to remove it
 
 Exit Status:
@@ -472,15 +487,13 @@ run_asset_find() {
     fi
 
     set -- "$@" -type f \
-        ! -name "$MANIFEST_NAME" \
-        ! -name "${MANIFEST_NAME}.asc" \
-        ! -name "${MANIFEST_NAME}.gpg" \
-        ! -name "${MANIFEST_NAME}.tsq" \
-        ! -name "${MANIFEST_NAME}.tsr" \
-        ! -name "${MANIFEST_NAME}.asc.tsq" \
-        ! -name "${MANIFEST_NAME}.asc.tsr" \
-        ! -name "*.tsq" \
-        ! -name "*.tsr"
+        ! -path "./$MANIFEST_NAME" \
+        ! -path "./${MANIFEST_NAME}.asc" \
+        ! -path "./${MANIFEST_NAME}.gpg" \
+        ! -path "./${MANIFEST_NAME}.tsq" \
+        ! -path "./${MANIFEST_NAME}.tsr" \
+        ! -path "./${MANIFEST_NAME}.asc.tsq" \
+        ! -path "./${MANIFEST_NAME}.asc.tsr"
 
     if [ "$find_action" = "list" ]; then
         set -- "$@" -print
@@ -869,6 +882,86 @@ verify_gpg_signature() {
     fi
 }
 
+# Extract an ISO-8601 UTC directory timestamp (YYYY-MM-DDTHHMMSSZ) from a .tsr file.
+extract_tsr_iso_stamp() {
+    e_tsr_file="$1"
+    e_stamp=""
+    if [ -f "$e_tsr_file" ]; then
+        e_tsr_text="$WORK_TMPDIR/archive_tsr_text.txt"
+        if openssl ts -reply -in "$e_tsr_file" -text >"$e_tsr_text" 2>/dev/null; then
+            e_stamp=$(awk '
+            BEGIN {
+                m["Jan"]="01"; m["Feb"]="02"; m["Mar"]="03"; m["Apr"]="04";
+                m["May"]="05"; m["Jun"]="06"; m["Jul"]="07"; m["Aug"]="08";
+                m["Sep"]="09"; m["Oct"]="10"; m["Nov"]="11"; m["Dec"]="12";
+            }
+            /^Time stamp:/ {
+                sub(/^Time stamp:[[:space:]]*/, "")
+                if (NF >= 4 && ($1 in m)) {
+                    mon = m[$1]
+                    day = sprintf("%02d", $2 + 0)
+                    hms = $3
+                    sub(/\..*$/, "", hms)
+                    gsub(/:/, "", hms)
+                    yr = $4
+                    if (yr ~ /^[0-9]{4}$/ && hms ~ /^[0-9]{6}$/) {
+                        printf "%s-%s-%sT%sZ\n", yr, mon, day, hms
+                        exit 0
+                    }
+                }
+            }
+            ' "$e_tsr_text")
+        fi
+    fi
+    if [ -z "$e_stamp" ]; then
+        e_stamp=$(date -u '+%Y-%m-%dT%H%M%SZ' 2>/dev/null || printf 'archive')
+    fi
+    printf '%s\n' "$e_stamp"
+}
+
+# Check whether a relative path (./...) would be pruned by EXCLUDE_LIST.
+is_path_excluded() {
+    check_rel="$1"
+    if [ -z "$EXCLUDE_LIST" ]; then
+        return 1
+    fi
+    check_stripped="${check_rel#./}"
+    IFS="$NL"
+    set -f
+    for pat in $EXCLUDE_LIST; do
+        set +f
+        IFS="$DEFAULT_IFS"
+        # Check each path prefix segment and basename against glob pattern
+        rem="$check_stripped"
+        prefix=""
+        while [ -n "$rem" ]; do
+            seg="${rem%%/*}"
+            if [ -z "$prefix" ]; then
+                prefix="$seg"
+            else
+                prefix="${prefix}/${seg}"
+            fi
+            # shellcheck disable=SC2254
+            case "$seg" in
+                $pat) return 0 ;;
+            esac
+            # shellcheck disable=SC2254
+            case "$prefix" in
+                $pat) return 0 ;;
+            esac
+            if [ "$rem" = "$seg" ]; then
+                break
+            fi
+            rem="${rem#*/}"
+        done
+        IFS="$NL"
+        set -f
+    done
+    set +f
+    IFS="$DEFAULT_IFS"
+    return 1
+}
+
 # ---------------------------------------------------------------------------
 # Generate Mode
 # ---------------------------------------------------------------------------
@@ -932,6 +1025,43 @@ do_generate() {
     actual_count=$(wc -l < "$STAGE_MANIFEST" | tr -d '[:space:]')
     if [ "$expected_count" != "$actual_count" ]; then
         die "$EXIT_MANIFEST" "File count mismatch during manifest generation (expected $expected_count, got $actual_count)."
+    fi
+
+    # 1b. Handle --archive (-a) change detection and proof rotation staging
+    ARCHIVE_TARGET_REL=""
+    if [ "$ARCHIVE_ENABLED" -eq 1 ] && [ -f "./$MANIFEST_NAME" ] && [ -f "./${MANIFEST_NAME}.asc" ] && [ -f "./${MANIFEST_NAME}.asc.tsr" ]; then
+        if [ "$FORCE_REGEN" -eq 0 ] && cmp -s -- "$STAGE_MANIFEST" "./$MANIFEST_NAME"; then
+            log_info "No asset changes detected in $(sanitize_text "$ABS_TARGET_DIR"); keeping existing manifest and RFC 3161 timestamp."
+            return 0
+        fi
+
+        base_stamp=$(extract_tsr_iso_stamp "./${MANIFEST_NAME}.asc.tsr")
+        archive_stamp="$base_stamp"
+        suffix_idx=1
+        while [ -e "./${ARCHIVE_DIR}/${archive_stamp}" ]; do
+            archive_stamp="${base_stamp}-${suffix_idx}"
+            suffix_idx=$((suffix_idx + 1))
+        done
+        ARCHIVE_TARGET_REL="./${ARCHIVE_DIR}/${archive_stamp}"
+        log_info "Staging previous attestation bundle for archive -> $(sanitize_text "${ARCHIVE_TARGET_REL#./}/")"
+
+        # Unless the archive directory is excluded via -x, include the archived proof
+        # artifacts in the new manifest so the root manifest forms a hash chain.
+        if ! is_path_excluded "${ARCHIVE_TARGET_REL}/${MANIFEST_NAME}"; then
+            for prev_art in "$MANIFEST_NAME" "${MANIFEST_NAME}.asc" "${MANIFEST_NAME}.asc.tsq" "${MANIFEST_NAME}.asc.tsr"; do
+                if [ -f "./$prev_art" ]; then
+                    prev_hash=$(hash_single_file "./$prev_art")
+                    printf '%s  %s/%s\n' "$prev_hash" "$ARCHIVE_TARGET_REL" "$prev_art" >> "$RAW_HASHES"
+                    expected_count=$((expected_count + 1))
+                fi
+            done
+            sort -k 1.67 -- "$RAW_HASHES" > "$STAGE_MANIFEST"
+            validate_manifest_structure "$STAGE_MANIFEST" "$WORK_TMPDIR/validated_manifest.txt"
+            actual_count=$(wc -l < "$STAGE_MANIFEST" | tr -d '[:space:]')
+            if [ "$expected_count" != "$actual_count" ]; then
+                die "$EXIT_MANIFEST" "File count mismatch after staging archive entries (expected $expected_count, got $actual_count)."
+            fi
+        fi
     fi
 
     log_detail "Hashed $actual_count file(s) -> $MANIFEST_NAME"
@@ -1003,7 +1133,17 @@ do_generate() {
     fi
     verify_rfc3161_token "$STAGE_SIG" "$STAGE_TSR" "$STAGE_TSQ" "$check_ca_on_gen"
 
-    # 6. Atomically move verified artifacts into target directory
+    # 6. Atomically move archived proof (if any) and verified artifacts into target directory
+    if [ -n "$ARCHIVE_TARGET_REL" ]; then
+        mkdir -p -- "$ARCHIVE_TARGET_REL" || die "$EXIT_ERR" "Failed to create archive directory '$(sanitize_text "$ARCHIVE_TARGET_REL")'."
+        for prev_art in "$MANIFEST_NAME" "${MANIFEST_NAME}.asc" "${MANIFEST_NAME}.asc.tsq" "${MANIFEST_NAME}.asc.tsr"; do
+            if [ -f "./$prev_art" ]; then
+                mv -f -- "./$prev_art" "${ARCHIVE_TARGET_REL}/${prev_art}"
+            fi
+        done
+        log_detail "Archived previous proof bundle -> $(sanitize_text "${ARCHIVE_TARGET_REL#./}/")"
+    fi
+
     chmod -- 0644 "$STAGE_MANIFEST" "$STAGE_SIG" "$STAGE_TSQ" "$STAGE_TSR"
     mv -f -- "$STAGE_MANIFEST" "./$MANIFEST_NAME"
     mv -f -- "$STAGE_SIG" "./${MANIFEST_NAME}.asc"
@@ -1175,6 +1315,143 @@ do_verify() {
 }
 
 # ---------------------------------------------------------------------------
+# Prove Mode (Verify Earliest Publication Timestamp for a Specific File)
+# ---------------------------------------------------------------------------
+
+do_prove() {
+    if [ ! -d "$TARGET_DIR" ]; then
+        die "$EXIT_USAGE" "Target directory does not exist: '$(sanitize_text "$TARGET_DIR")'."
+    fi
+
+    setup_tmpdir
+
+    # Allow PROVE_FILE to be specified either relative to TARGET_DIR or prefixed with TARGET_DIR/
+    prove_rel="$PROVE_FILE"
+    target_prefix="${TARGET_DIR%/}/"
+    case "$prove_rel" in
+        "$target_prefix"*)
+            prove_rel="${prove_rel#"$target_prefix"}"
+            ;;
+    esac
+
+    cd -- "$TARGET_DIR" || die "$EXIT_ERR" "Cannot enter target directory: '$(sanitize_text "$TARGET_DIR")'."
+    ABS_TARGET_DIR=$(pwd)
+
+    # Normalize to ./<path>
+    prove_rel="${prove_rel#./}"
+    case "$prove_rel" in
+        "" | /* | *"\\"* | *[[:cntrl:]]* | ../* | */../* | */.. | ..)
+            die "$EXIT_USAGE" "Invalid asset path for --prove: '$(sanitize_text "$PROVE_FILE")' (must be a safe relative path inside target directory)."
+            ;;
+    esac
+    NORM_PROVE_PATH="./${prove_rel}"
+
+    if [ "$FOLLOW_SYMLINKS" -eq 0 ] && [ -L "$NORM_PROVE_PATH" ]; then
+        die "$EXIT_MANIFEST" "Target asset '$(sanitize_text "$NORM_PROVE_PATH")' is a symbolic link (rejected for security)."
+    fi
+    if [ ! -f "$NORM_PROVE_PATH" ]; then
+        die "$EXIT_MANIFEST" "Target asset not found: '$(sanitize_text "$NORM_PROVE_PATH")' in $(sanitize_text "$ABS_TARGET_DIR")."
+    fi
+
+    PROVE_HASH=$(hash_single_file "$NORM_PROVE_PATH")
+    log_info "Searching timestamp proofs for $(sanitize_text "$NORM_PROVE_PATH")..."
+    log_detail "Current SHA-256: $PROVE_HASH"
+
+    # Build ordered list of bundle directories: archived bundles in ./$ARCHIVE_DIR/* first, then .
+    set --
+    if [ -d "./$ARCHIVE_DIR" ]; then
+        for arch_sub in "./${ARCHIVE_DIR}"/*; do
+            if [ -d "$arch_sub" ] && [ -f "${arch_sub}/${MANIFEST_NAME}" ]; then
+                set -- "$@" "$arch_sub"
+            fi
+        done
+    fi
+    if [ -f "./$MANIFEST_NAME" ]; then
+        set -- "$@" "."
+    fi
+
+    if [ "$#" -eq 0 ]; then
+        die "$EXIT_MANIFEST" "No manifest bundles found in $(sanitize_text "$ABS_TARGET_DIR")."
+    fi
+
+    matched_proofs=0
+    earliest_time=""
+    earliest_iso=""
+    earliest_bundle=""
+    earliest_tsa=""
+    earliest_serial=""
+
+    for b_dir in "$@"; do
+        b_manifest="${b_dir}/${MANIFEST_NAME}"
+        b_sig="${b_dir}/${MANIFEST_NAME}.asc"
+        b_tsq="${b_dir}/${MANIFEST_NAME}.asc.tsq"
+        b_tsr="${b_dir}/${MANIFEST_NAME}.asc.tsr"
+
+        if [ ! -f "$b_manifest" ] || [ ! -f "$b_sig" ] || [ ! -f "$b_tsr" ]; then
+            continue
+        fi
+
+        norm_b_manifest="$WORK_TMPDIR/prove_norm_manifest.txt"
+        validate_manifest_structure "$b_manifest" "$norm_b_manifest"
+
+        recorded_hash=$(awk -v target="$NORM_PROVE_PATH" '
+            substr($0, 67) == target {
+                print substr($0, 1, 64)
+                exit 0
+            }
+        ' "$norm_b_manifest")
+
+        if [ -z "$recorded_hash" ]; then
+            continue
+        fi
+
+        if [ "$recorded_hash" != "$PROVE_HASH" ]; then
+            log_detail "Skipping $(sanitize_text "${b_dir#./}") (recorded SHA-256 $recorded_hash differs from current file)"
+            continue
+        fi
+
+        log_info "Verifying matching proof bundle in $(sanitize_text "$b_dir")..."
+        b_tsq_arg=""
+        if [ -f "$b_tsq" ]; then
+            b_tsq_arg="$b_tsq"
+        fi
+        verify_rfc3161_token "$b_sig" "$b_tsr" "$b_tsq_arg" "$VERIFY_TS_CERT"
+        verify_gpg_signature "$b_manifest" "$b_sig"
+
+        tsr_kv=$(parse_tsr_info "$b_tsr")
+        b_time=$(get_kv_field "$tsr_kv" "TSR_TIME")
+        b_tsa=$(get_kv_field "$tsr_kv" "TSR_TSA_NAME")
+        b_serial=$(get_kv_field "$tsr_kv" "TSR_SERIAL")
+        b_iso=$(extract_tsr_iso_stamp "$b_tsr")
+
+        matched_proofs=$((matched_proofs + 1))
+        if [ -z "$earliest_iso" ] || awk -v a="$b_iso" -v b="$earliest_iso" 'BEGIN { exit !(a < b) }'; then
+            earliest_iso="$b_iso"
+            earliest_time="$b_time"
+            earliest_bundle="$b_tsr"
+            earliest_tsa="$b_tsa"
+            earliest_serial="$b_serial"
+        fi
+    done
+
+    if [ "$matched_proofs" -eq 0 ]; then
+        die "$EXIT_MANIFEST" "No valid cryptographic timestamp proof found matching current SHA-256 ($PROVE_HASH) of '$(sanitize_text "$NORM_PROVE_PATH")'."
+    fi
+
+    log_info "Publication Proof Verified for $(sanitize_text "$NORM_PROVE_PATH"):"
+    log_detail "Asset SHA-256  : $PROVE_HASH"
+    log_detail "Verified Proofs: $matched_proofs bundle(s)"
+    log_detail "Earliest Date  : $(sanitize_text "$earliest_time") ($earliest_iso)"
+    log_detail "Earliest Token : $(sanitize_text "$earliest_bundle")"
+    if [ -n "$earliest_tsa" ]; then
+        log_detail "Earliest TSA   : $(sanitize_text "$earliest_tsa")"
+    fi
+    if [ -n "$earliest_serial" ]; then
+        log_detail "Earliest Serial: $(sanitize_text "$earliest_serial")"
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Command-Line Argument Parsing (POSIX sh)
 # ---------------------------------------------------------------------------
 
@@ -1195,6 +1472,36 @@ parse_args() {
                 ;;
             -V|--verify)
                 MODE="verify"
+                shift
+                ;;
+            -P|--prove)
+                [ "$#" -ge 2 ] || die "$EXIT_USAGE" "Option '$1' requires a file path argument."
+                MODE="prove"
+                PROVE_FILE="$2"
+                shift 2
+                ;;
+            --prove=*)
+                MODE="prove"
+                PROVE_FILE="${1#*=}"
+                shift
+                ;;
+            -a|--archive)
+                ARCHIVE_ENABLED=1
+                shift
+                ;;
+            --archive-dir)
+                [ "$#" -ge 2 ] || die "$EXIT_USAGE" "Option '$1' requires a directory argument."
+                ARCHIVE_ENABLED=1
+                ARCHIVE_DIR="$2"
+                shift 2
+                ;;
+            --archive-dir=*)
+                ARCHIVE_ENABLED=1
+                ARCHIVE_DIR="${1#*=}"
+                shift
+                ;;
+            --force)
+                FORCE_REGEN=1
                 shift
                 ;;
             -d|--dir)
@@ -1385,6 +1692,15 @@ parse_args() {
             ;;
     esac
 
+    # Normalize and validate ARCHIVE_DIR (must be a safe relative directory path inside TARGET_DIR)
+    ARCHIVE_DIR="${ARCHIVE_DIR#./}"
+    ARCHIVE_DIR="${ARCHIVE_DIR%/}"
+    case "$ARCHIVE_DIR" in
+        "" | . | .. | /* | ../* | */../* | */.. | *"\\"* | *[[:cntrl:]]*)
+            die "$EXIT_USAGE" "Invalid archive directory: '$(sanitize_text "$ARCHIVE_DIR")' (must be a safe relative subdirectory path inside target directory)."
+            ;;
+    esac
+
     # Validate KEEP_TSQ is 0 or 1
     case "$KEEP_TSQ" in
         0|1) ;;
@@ -1451,6 +1767,9 @@ main() {
             ;;
         verify)
             do_verify
+            ;;
+        prove)
+            do_prove
             ;;
     esac
 }

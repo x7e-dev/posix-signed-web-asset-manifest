@@ -49,6 +49,7 @@ Designed for static websites, software release directories, and archival bundles
 - **100% POSIX Compliant**: Written in strict POSIX `sh` (`IEEE Std 1003.1-2017` / `1003.1-2024`) with zero bashisms. Tested across `/bin/sh`, `dash`, `ksh`, `bash --posix`, and `zsh`.
 - **Cross-Platform SHA-256 Normalization**: Automatically detects and normalizes output across GNU/Linux `sha256sum`, macOS/Perl `shasum -a 256`, FreeBSD/OpenBSD/NetBSD `sha256 -r`, and `openssl dgst -sha256 -r` to produce byte-for-byte identical `SHA256SUMS` files on every OS.
 - **Built-in Generation & Three-Layer Verification (`-V` / `--verify`)**: Both creates attestation bundles and verifies them in strict outer-to-inner (*Verify-Then-Parse*) cryptographic order.
+- **Chained Proof Archiving & Publication Date Proofs (`-a` & `-P`)**: Preserves historical attestation bundles in `proofs/<ISO-8601-UTC>/` when site files change (while skipping no-op builds) and cryptographically chains them into the new root `SHA256SUMS`, allowing `-P FILE` to prove the earliest verified publication date of any unchanged asset across site updates.
 - **Selectable Time Stamping Authorities (`-t` / `--tsa`)**: Includes built-in presets for well-known public RFC 3161 TSAs (`freetsa`, `digicert`, `sectigo`, `globalsign`, `entrust`, `apple`, `identrust`) and accepts any custom `https://` or `http://` TSA endpoint URL.
 - **Atomic Staging & Rollback**: Builds and self-verifies all artifacts inside a private (`0700`) temporary staging directory before atomically moving them into the target directory. If signing or TSA timestamping fails, pre-existing valid artifacts are never corrupted or deleted.
 - **Defense-in-Depth Security**:
@@ -127,6 +128,25 @@ Verify all three layers (RFC 3161 timestamp, GPG signature, and SHA-256 asset ch
 ./mk-web-manifest.sh -V --no-ts-cert-verify ./dist
 ```
 
+### 4. Preserve & Prove Original Publication Dates Across Site Updates (`-a` & `-P`)
+
+When updating a site over time, overwriting a single `SHA256SUMS.asc.tsr` replaces the older timestamp with the latest deploy date. Using `-a` (`--archive`) solves this automatically:
+
+```sh
+# On every deploy/update, run with -a (--archive):
+./mk-web-manifest.sh -a -t digicert ./site
+```
+
+1. **No-Op on Unchanged Builds**: If no tracked files in `./site` have changed since the current `SHA256SUMS` was generated, `-a` exits `0` immediately without querying the TSA or altering your existing `.tsr` timestamp.
+2. **Chained Proof Rotation on Updates**: If files were added, modified, or removed, `-a` rotates the previous `SHA256SUMS*` bundle into `./proofs/<ISO-8601-UTC-timestamp>/` (derived from the previous `.tsr` token's attested time) and hashes those archived proof files into the new root `SHA256SUMS`.
+3. **Prove Earliest Publication Date (`-P` / `--prove`)**: At any point in the future, you can prove when any unchanged file was originally published—even if `index.html` or other site files were updated dozens of times since:
+
+```sh
+./mk-web-manifest.sh -P articles/2026-11-04-first-post.pdf ./site
+```
+
+`-P` scans all archived bundles in `./proofs/*` and the active root manifest, verifies the RFC 3161 `.tsr` token and GPG `.asc` signature of every bundle containing a matching SHA-256 for that file, and reports the **earliest cryptographically verified publication timestamp**.
+
 ---
 
 ## Command-Line Reference
@@ -134,12 +154,16 @@ Verify all three layers (RFC 3161 timestamp, GPG signature, and SHA-256 asset ch
 ```text
 Usage:
   mk-web-manifest.sh [OPTIONS] [TARGET_DIR]
+  mk-web-manifest.sh -a [OPTIONS] [TARGET_DIR]
   mk-web-manifest.sh -V [OPTIONS] [TARGET_DIR]
+  mk-web-manifest.sh -P FILE [OPTIONS] [TARGET_DIR]
   mk-web-manifest.sh --list-tsa
 
 Modes:
   (default)              Generate manifest, GPG signature, and RFC 3161 timestamp
   -V, --verify           Verify existing manifest, signature, and timestamp
+  -P, --prove FILE       Prove original publication date of FILE across archived
+                         and active timestamped manifests
       --list-tsa         List built-in RFC 3161 TSA presets and exit
   -h, --help             Display this help message and exit
   -v, --version          Display version information and exit
@@ -147,6 +171,12 @@ Modes:
 Options:
   -d, --dir DIR          Target directory (default: positional TARGET_DIR or '.')
   -m, --manifest NAME    Manifest filename (default: SHA256SUMS)
+  -a, --archive          Archive existing manifest bundle into proofs/<timestamp>/
+                         when site files change (and skip if unchanged)
+      --archive-dir DIR  Directory (relative to TARGET_DIR) for archived proofs
+                         (default: proofs; implies --archive)
+      --force            Force regeneration (and archiving if -a is set) even if
+                         no tracked asset hashes have changed
   -k, --gpg-key KEY      GPG key ID, fingerprint, or email for signing
       --gpg-homedir DIR  Custom GnuPG home directory
       --keyring FILE     Additional GPG keyring file for verification
@@ -161,7 +191,7 @@ Options:
       --untrusted FILE   Untrusted intermediate certificates PEM for TSA verify
       --no-ts-cert-verify
                          Verify timestamp token imprint/nonce without X.509 CA
-                         chain validation during --verify
+                         chain validation during --verify or --prove
   -x, --exclude PATTERN  Exclude files/directories matching glob PATTERN
                          (may be specified multiple times)
       --include-vcs      Do not exclude .git, .hg, and .svn directories
@@ -183,6 +213,7 @@ Options:
 | `TSA_UNTRUSTED_FILE` | Untrusted intermediate certificates PEM file | *(none)* |
 | `TSA_TIMEOUT` | HTTP request timeout in seconds | `30` |
 | `MANIFEST_NAME` | Manifest filename | `SHA256SUMS` |
+| `ARCHIVE_DIR` | Relative subdirectory for archived proof bundles | `proofs` |
 | `KEEP_TSQ` | Retain `.tsq` file (`1`) or remove after generation (`0`) | `1` |
 | `POSIX_MANIFEST_SHA256_BACKEND` | Force specific hash tool (`sha256sum`, `shasum`, `sha256`, `openssl`) | *(auto-detected)* |
 
@@ -238,8 +269,15 @@ man ./mk-web-manifest.1
 
 ### Run the Automated Test Suite
 
-The test suite (`tests/run-tests.sh`) is 100% POSIX-compliant, sets up a local ephemeral X.509 Root CA and RFC 3161 TSA responder via `openssl ts -reply`, and runs 51 functional, cross-shell, cross-backend, and security tamper-detection tests offline:
+The test suite (`tests/run-tests.sh`) is 100% POSIX-compliant, sets up a local ephemeral X.509 Root CA and RFC 3161 TSA responder via `openssl ts -reply`, and runs 62 functional, archive/publication-proof, cross-shell, cross-backend, and security tamper-detection tests offline:
 
 ```sh
 ./tests/run-tests.sh
 ```
+
+---
+
+## License
+
+Released under the [MIT License](LICENSE).
+

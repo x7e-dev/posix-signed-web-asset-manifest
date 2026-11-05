@@ -6,15 +6,17 @@
 .Nd generate and verify a signed, RFC 3161 timestamped SHA-256 asset manifest
 .Sh SYNOPSIS
 .Nm
-.Op Fl Lq
+.Op Fl aLq
 .Op Fl C Ar ca-file
 .Op Fl d Ar dir
 .Op Fl k Ar gpg-key
 .Op Fl m Ar manifest
 .Op Fl t Ar tsa
 .Op Fl x Ar pattern
+.Op Fl -archive-dir Ar dir
 .Op Fl -ca-path Ar dir
 .Op Fl -clearsign
+.Op Fl -force
 .Op Fl -gpg-homedir Ar dir
 .Op Fl -include-vcs
 .Op Fl -keep-tsq | Fl -no-keep-tsq
@@ -32,6 +34,19 @@
 .Op Fl -ca-path Ar dir
 .Op Fl -gpg-homedir Ar dir
 .Op Fl -include-vcs
+.Op Fl -keyring Ar file
+.Op Fl -no-ts-cert-verify
+.Op Fl -untrusted Ar cert-file
+.Op Ar target-dir
+.Nm
+.Fl P Ar file
+.Op Fl Lq
+.Op Fl C Ar ca-file
+.Op Fl d Ar dir
+.Op Fl m Ar manifest
+.Op Fl -archive-dir Ar dir
+.Op Fl -ca-path Ar dir
+.Op Fl -gpg-homedir Ar dir
 .Op Fl -keyring Ar file
 .Op Fl -no-ts-cert-verify
 .Op Fl -untrusted Ar cert-file
@@ -120,6 +135,41 @@ untracked files exist in
 Verify existing attestation artifacts in
 .Ar target-dir
 instead of generating new ones.
+.It Fl P Ar file , Fl -prove Ar file
+Prove the earliest publication timestamp of
+.Ar file
+by scanning both archived proof bundles in
+.Pa proofs/
+(or
+.Fl -archive-dir )
+and the active root manifest, cryptographically verifying each matching
+bundle's RFC 3161 timestamp and GnuPG signature against the file's current
+SHA-256 digest.
+.It Fl a , Fl -archive
+When regenerating a manifest in a directory that already has an attestation
+bundle, compare current asset hashes against the existing manifest.
+If no tracked files have changed (and
+.Fl -force
+is not given), exit 0 without re-signing or replacing the existing RFC 3161
+timestamp.
+If files have changed, rotate the previous attestation bundle into
+.Pa proofs/<ISO-timestamp>/
+(and chain its hashes into the new root manifest) so original publication date
+proofs for unchanged files are permanently preserved.
+.It Fl -archive-dir Ar dir
+Use
+.Ar dir
+(relative to
+.Ar target-dir ,
+default:
+.Pa proofs )
+for storing and searching archived proof bundles.
+Implies
+.Fl a .
+.It Fl -force
+Force manifest regeneration (and archiving of the previous bundle when
+.Fl a
+is active) even if no tracked asset hashes have changed.
 .It Fl d Ar dir , Fl -dir Ar dir
 Operate on directory
 .Ar dir .
@@ -263,6 +313,11 @@ Default HTTP request timeout in seconds (overridden by
 .It Ev MANIFEST_NAME
 Default manifest filename (overridden by
 .Fl m ) .
+.It Ev ARCHIVE_DIR
+Default relative subdirectory for archived proof bundles (default:
+.Pa proofs ;
+overridden by
+.Fl -archive-dir ) .
 .It Ev KEEP_TSQ
 Set to
 .Ql 1
@@ -336,6 +391,18 @@ mk-web-manifest.sh -V -C /path/to/tsa-root-ca.pem ./public
 Exclude source maps and temporary files during generation:
 .Bd -literal -offset indent
 mk-web-manifest.sh -x '*.map' -x '*.tmp' ./dist
+.Ed
+.Pp
+Update a site while archiving previous proof bundles when files change (and
+skipping if nothing changed):
+.Bd -literal -offset indent
+mk-web-manifest.sh -a -t digicert ./site
+.Ed
+.Pp
+Prove the earliest verified publication date of a specific file across archived
+and active manifests:
+.Bd -literal -offset indent
+mk-web-manifest.sh -P articles/whitepaper.pdf ./site
 .Ed
 .Sh SEE ALSO
 .Xr curl 1 ,

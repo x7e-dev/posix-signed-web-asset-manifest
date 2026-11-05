@@ -645,9 +645,82 @@ after_tsr_hash=$(openssl dgst -sha256 -r "${TRAV_DIR}/SHA256SUMS.asc.tsr" | awk 
 assert_eq "$orig_tsr_hash" "$after_tsr_hash" "Atomic staging preserves pre-existing valid artifacts when TSA fails"
 
 # ---------------------------------------------------------------------------
-# 6. Cross-Shell Execution Test (/bin/sh, /bin/dash, /bin/ksh)
+# 6. Archive Rotation (-a) & Original Publication Date Proof (-P)
 # ---------------------------------------------------------------------------
-printf '\n=== 6. Cross-Shell Full Execution (/bin/sh, /bin/dash, /bin/ksh) ===\n'
+printf '\n=== 6. Archive Rotation (-a) & Original Publication Date Proof (-P) ===\n'
+
+PUB_DIR="${TEST_TMP}/pub_site"
+mkdir -p -- "${PUB_DIR}/articles"
+printf '<h1>Home v1</h1>\n' > "${PUB_DIR}/index.html"
+printf 'Original whitepaper v1 content\n' > "${PUB_DIR}/articles/first-post.pdf"
+
+# Initial publication with -a
+"$TARGET_SCRIPT" -q -a -t digicert -C "${PKI_DIR}/ca.crt" "$PUB_DIR"
+first_tsr_hash=$(openssl dgst -sha256 -r "${PUB_DIR}/SHA256SUMS.asc.tsr" | awk '{print $1}')
+
+# Re-running with -a when no files changed should skip regeneration and keep the original .tsr
+# (Even with MOCK_TSA_MODE=http500, it must succeed because no TSA request is made)
+if MOCK_TSA_MODE="http500" "$TARGET_SCRIPT" -q -a -t digicert -C "${PKI_DIR}/ca.crt" "$PUB_DIR"; then
+    pass "-a skips TSA request and exits 0 when no tracked files changed"
+else
+    fail "-a skips TSA request and exits 0 when no tracked files changed"
+fi
+
+unchanged_tsr_hash=$(openssl dgst -sha256 -r "${PUB_DIR}/SHA256SUMS.asc.tsr" | awk '{print $1}')
+assert_eq "$first_tsr_hash" "$unchanged_tsr_hash" "-a preserves original .tsr token when site is unchanged"
+
+# If TSA fails during an update with -a, no partial proofs/ directory should be created
+printf '<h1>Home v2</h1>\n' > "${PUB_DIR}/index.html"
+rc=0
+MOCK_TSA_MODE="http500" "$TARGET_SCRIPT" -q -a -t digicert -C "${PKI_DIR}/ca.crt" "$PUB_DIR" 2>/dev/null || rc=$?
+assert_eq "6" "$rc" "TSA failure during -a exits with code 6"
+if [ ! -d "${PUB_DIR}/proofs" ]; then
+    pass "Atomic staging with -a leaves no partial proofs/ directory on TSA failure"
+else
+    fail "Atomic staging with -a leaves no partial proofs/ directory on TSA failure"
+fi
+
+# Now succeed on site update (index.html modified + second-post.pdf added; first-post.pdf untouched)
+printf 'Second article content\n' > "${PUB_DIR}/articles/second-post.pdf"
+"$TARGET_SCRIPT" -q -a -t digicert -C "${PKI_DIR}/ca.crt" "$PUB_DIR"
+
+if [ -d "${PUB_DIR}/proofs" ]; then
+    pass "-a creates proofs/<timestamp>/ archive directory on site update"
+else
+    fail "-a creates proofs/<timestamp>/ archive directory on site update"
+fi
+
+if grep -q '^\([0-9a-f]\{64\}\)  \./proofs/.*/SHA256SUMS\.asc\.tsr$' "${PUB_DIR}/SHA256SUMS"; then
+    pass "New root SHA256SUMS cryptographically chains archived proofs/<timestamp>/ artifacts"
+else
+    fail "New root SHA256SUMS cryptographically chains archived proofs/<timestamp>/ artifacts"
+fi
+
+if "$TARGET_SCRIPT" -V -q -C "${PKI_DIR}/ca.crt" "$PUB_DIR"; then
+    pass "Full site verification (-V) passes with chained proofs/ archive"
+else
+    fail "Full site verification (-V) passes with chained proofs/ archive"
+fi
+
+# Prove original publication date of ./articles/first-post.pdf via -P
+prove_out=$("$TARGET_SCRIPT" -P "articles/first-post.pdf" -C "${PKI_DIR}/ca.crt" "$PUB_DIR")
+assert_contains "$prove_out" "Verified Proofs: 2 bundle(s)" "-P verifies both archived and live proof bundles for unchanged file"
+assert_contains "$prove_out" "./proofs/" "-P identifies earliest proof inside ./proofs/<timestamp>/"
+
+# Prove publication date of newly added ./articles/second-post.pdf (only in latest bundle)
+prove_new_out=$("$TARGET_SCRIPT" -P "articles/second-post.pdf" -C "${PKI_DIR}/ca.crt" "$PUB_DIR")
+assert_contains "$prove_new_out" "Verified Proofs: 1 bundle(s)" "-P verifies single proof bundle for newly added file"
+
+# Tampering with first-post.pdf causes -P to fail with exit code 4
+printf 'tampered content\n' >> "${PUB_DIR}/articles/first-post.pdf"
+rc=0
+"$TARGET_SCRIPT" -P "articles/first-post.pdf" -q -C "${PKI_DIR}/ca.crt" "$PUB_DIR" 2>/dev/null || rc=$?
+assert_eq "4" "$rc" "-P rejects modified file whose SHA-256 matches no signed proof (exit 4)"
+
+# ---------------------------------------------------------------------------
+# 7. Cross-Shell Execution Test (/bin/sh, /bin/dash, /bin/ksh)
+# ---------------------------------------------------------------------------
+printf '\n=== 7. Cross-Shell Full Execution (/bin/sh, /bin/dash, /bin/ksh) ===\n'
 
 for shell_bin in /bin/sh /bin/dash /bin/ksh; do
     if [ -x "$shell_bin" ]; then
